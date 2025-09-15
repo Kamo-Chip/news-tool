@@ -3,6 +3,33 @@ import "dotenv/config";
 import { XMLParser } from "fast-xml-parser";
 import * as cheerio from "cheerio";
 import OpenAI from "openai";
+import { Resend } from "resend";
+
+import fs from "fs";
+import path from "path";
+
+const FEEDS = [
+  "https://mybroadband.co.za/news/feed/",
+  "https://mg.co.za/feed/",
+  "https://www.dailymaverick.co.za/dmrss/",
+  "https://rss.iol.io/iol/news",
+  "https://techcentral.co.za/feed/",
+];
+
+const openai = new OpenAI();
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+const seenFile = path.resolve("./seen.json");
+let seen = [];
+if (fs.existsSync(seenFile)) {
+  try {
+    const data = JSON.parse(fs.readFileSync(seenFile, "utf8"));
+    seen = data.seen || [];
+  } catch (e) {
+    console.error("Error reading seen.json, starting fresh:", e);
+    seen = [];
+  }
+}
 
 async function fetchHtml(url) {
   const res = await fetch(url, {
@@ -34,8 +61,8 @@ function extractArticleText(html, url) {
     "aside",
     ".advert",
     ".ads",
-    "[class*='ad-']",
-    "[id*='ad-']",
+    // "[class*='ad-']",
+    // "[id*='ad-']",
     ".newsletter",
     ".subscribe",
     ".paywall",
@@ -112,32 +139,13 @@ function extractArticleText(html, url) {
   return { text: clipped, approxChars: clipped.length, sourceUrl: url };
 }
 
-const parser = new XMLParser();
-let response = await fetch("https://mybroadband.co.za/news/feed/");
-const data = await response.text();
-
-let jObj = parser.parse(data);
-
-let items = jObj.rss.channel.item.slice(0, 1);
-
-const openai = new OpenAI();
-
-for (const item of items) {
-  try {
-    const url = item.link;
-    console.log(`Fetching article: ${url}`);
-    const html = await fetchHtml(url);
-    const article = extractArticleText(html, url);
-    console.log(
-      `Extracted article text, approx ${article.approxChars} chars. Summarizing...`
-    );
-
-    const summary = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        {
-          role: "system",
-          content: `You are a news explainer that extracts the most important, factual takeaways from articles. Given an article, identify the key facts a citizen should know to stay informed. Output them as a concise, easy-to-read list.
+async function summariseArticle(article) {
+  const summary = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [
+      {
+        role: "system",
+        content: `You are a news explainer that extracts the most important, factual takeaways from articles. Given an article, identify the key facts a citizen should know to stay informed. Output them as a concise, easy-to-read list.
 
                 Guidelines:
                 - Focus only on what matters: who, what, where, when, why, how.
@@ -146,26 +154,131 @@ for (const item of items) {
                 - Avoid jargon; explain in simple terms.
                 - If relevant, include why this matters to ordinary citizens.
                 - Write in plain text, not markdown.
+                - Return your output as valid JSON.
 
-                Example output:
-                - [Key Fact 1]
-                - [Key Fact 2]
-                - [Key Fact 3]
-                ...`,
-        },
-        {
-          role: "user",
-          content: `Article: ${article.text}`,
-        },
-      ],
-    });
+                Example output as JSON:
+                {
+                    keyFacts: [
+                        "Key fact 1",
+                        "Key fact 2",
+                        "Key fact 3",
+                        "...",
+                    ]
+                }`,
+      },
+      {
+        role: "user",
+        content: `Article: ${article.text}`,
+      },
+    ],
+  });
 
-    console.log("\n=== SUMMARY ===\n");
-    console.log("\nTITLE: " + item.title + "\n");   
-    console.log(summary.choices[0].message.content.trim());
-    console.log("\nURL: " + article.sourceUrl + "\n");
-    console.log("\n");
-  } catch (err) {
-    console.error("Error processing item:", err);
+  return JSON.parse(summary.choices[0].message.content.trim()).keyFacts;
+}
+
+async function getArticlesFromFeed(url) {
+  const parser = new XMLParser();
+  let response = await fetch(url);
+  const data = await response.text();
+
+  let jObj = parser.parse(data);
+
+  let items = jObj.rss.channel.item.slice(0, 1);
+
+  return items;
+}
+
+function buildEmailTemplate({ title, summary, url }) {
+  const summaryHtml = `<ul style="padding-left: 20px; margin: 0; color: #333;">${summary
+    .map(
+      (point) =>
+        `<li style="margin-bottom: 8px; font-size: 15px; line-height: 1.4;">${point}</li>`
+    )
+    .join("")}</ul>`;
+
+  return `
+  <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; background: #ffffff; border: 1px solid #ddd; border-radius: 8px; overflow: hidden;">
+    <div style="background: #0077cc; color: white; padding: 16px; text-align: center;">
+      <h1 style="margin: 0; font-size: 20px;">${title}</h1>
+    </div>
+    <div style="padding: 16px; color: #333;">
+      ${summaryHtml}
+      <p style="margin-top: 20px; text-align: center;">
+        <a href="${url}" style="background: #0077cc; color: white; padding: 10px 16px; text-decoration: none; border-radius: 4px; font-size: 14px; display: inline-block;">Read Full Article</a>
+      </p>
+    </div>
+    <div style="background: #f4f4f4; padding: 12px; text-align: center; font-size: 12px; color: #666;">
+     <a href="${url}" style="color: #0077cc;">Source</a>
+    </div>
+  </div>
+  `;
+}
+
+async function sendDigestEmail(html) {
+  console.log("Sending email...");
+
+  const { error } = await resend.emails.send({
+    from: "News Digest <newsdigest@honourablemembergpt.com>",
+    to: ["kamokhumalo04@gmail.com"],
+    subject: "Stay Up to Date 🧠",
+    html: html,
+  });
+
+  if (error) {
+    return console.error({ error });
   }
+
+  console.log("Email sent successfully!");
+}
+
+async function generateSummaries() {
+  let summaries = [];
+  let newSeen = [...seen];
+
+  await Promise.all(
+    FEEDS.map(async (feed) => {
+      const items = await getArticlesFromFeed(feed);
+      for (const item of items) {
+        try {
+          const url = item.link;
+
+          if (seen.includes(url)) {
+            console.log(`Already seen article, skipping: ${url}`);
+            continue;
+          }
+
+          console.log(`Fetching article from feed ${feed}: ${url}`);
+          const html = await fetchHtml(url);
+
+          const article = extractArticleText(html, url);
+          console.log(
+            `Extracted article text, approx ${article.approxChars} chars. Summarizing...`
+          );
+
+          const summary = await summariseArticle(article);
+          summaries.push({
+            title: item.title,
+            summary,
+            url: article.sourceUrl,
+          });
+
+          newSeen.push(url);
+        } catch (err) {
+          console.error("Error processing item:", err);
+        }
+      }
+    })
+  );
+  fs.writeFileSync(seenFile, JSON.stringify({ seen: newSeen }, null, 2));
+
+  return summaries;
+}
+
+const summaries = await generateSummaries();
+
+if (summaries.length) {
+  const templates = summaries.map((s) => buildEmailTemplate(s)).join("<hr/>");
+  await sendDigestEmail(templates);
+} else {
+  console.log("No new articles to summarise.");
 }
