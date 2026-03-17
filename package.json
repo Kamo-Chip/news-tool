@@ -1,8 +1,10 @@
 {
   "dependencies": {
+    "@mozilla/readability": "^0.6.0",
     "cheerio": "^1.1.2",
     "dotenv": "^17.2.2",
     "fast-xml-parser": "^5.2.5",
+    "jsdom": "^26.1.0",
     "openai": "^5.19.1",
     "resend": "^6.0.3"
   },
